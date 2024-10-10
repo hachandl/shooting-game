@@ -6,25 +6,29 @@
 #include <string.h>
 #include <wchar.h>
 
-
-
 #pragma region 키보드 
 #define LEFT 75
 #define RIGHT 77
 #define SPACE 32
 #pragma endregion
 #pragma region 벨런스
+#define MAX_ENEMY_ATTACKS_PER_SHOT 10    // 한 번에 발사하는 최대 적 공격 수
+#define ENEMY_ATTACK_INTERVAL 1500       // 적 공격 간격 (밀리초)
+#define ENEMY_ATTACK_SPEED 100           // 적 공격 이동 속도 (밀리초)
+#define MAX_ENEMY_PROJECTILES 1000       // 적의 총 공격량 (무한대로 증가 가능)
 #define INITIAL_ENEMY_SPAWN_DELAY 750 // 초기 적 소환 간격 (밀리초)
 #define INITIAL_ENEMY_MOVE_DELAY 750  // 초기 적 이동 간격 (밀리초)
 #define MAX_ENEMIES 1000 //최대 적의 개수
+#define ATTACK_COOLDOWN 500 // 공격 후 대기 시간
 #pragma endregion
 
 int enemy_count = 0; // 현재 적 개수
 int canAttack = 1;
 int score = 0; // 점수 변수
 int health = 3; // 플레이어 체력
-int isInvincible = 0; // 무적 상태를 추적하는 변수 추가
+int isInvincible = 0; // 무적 상태를 추적하는 변수
 int invincibleDuration = 100; // 무적 상태 유지 시간 (밀리초)
+int isGameOver = 0; // 게임 오버 상태를 추적하는 변수
 CRITICAL_SECTION cs; //멀티 스레드
 
 #pragma region 위치 함수
@@ -61,6 +65,11 @@ typedef struct Enemy
     const char* shape;
     int active;
 } Enemy;
+typedef struct EnemyAttack
+{
+    int x, y;      // 공격의 현재 위치
+    int active;    // 공격이 활성화되었는지 여부
+} EnemyAttack;
 #pragma endregion
 #pragma region 맵
 char Map[32][22] = {
@@ -121,7 +130,7 @@ void Rendering_Map()
 #pragma endregion
 
 Enemy enemies[MAX_ENEMIES]; // 적 배열
-
+EnemyAttack enemy_attacks[MAX_ENEMY_PROJECTILES]; // 적 공격 배열
 //커서 삭제
 void CursorView()
 {
@@ -138,7 +147,6 @@ void DisplayStatus()
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), status_position);
     printf("Score: %d    Health: ", score); // 점수 표시
 
-    // 체력을 '♡'로 표시
     for (int i = 0; i < health; i++) {
         printf("♡ ");
     }
@@ -154,6 +162,8 @@ void GameOver()
     printf("Your Score: %d\n", score);
     printf("Press ENTER to exit...");
     LeaveCriticalSection(&cs);
+
+    isGameOver = 1;  // 게임 오버 상태로 변경
 
     // Enter 키 입력 대기
     while (1)
@@ -173,7 +183,6 @@ void Attack(int x, int y, wchar_t ch)
     WriteConsoleOutputCharacter(GetStdHandle(STD_OUTPUT_HANDLE), &ch, 1, pos, &written);
     LeaveCriticalSection(&cs); // Leave Critical Section
 }
-
 // 적과 플레이어 충돌 체크 함수
 void CheckCollisionWithEnemy(Character* player)
 {
@@ -208,7 +217,6 @@ void CheckCollisionWithEnemy(Character* player)
         }
     }
 }
-
 // 적 이동 및 충돌 처리 함수
 void MoveEnemies(int moveDelay, Character* player)
 {
@@ -235,8 +243,16 @@ void MoveEnemies(int moveDelay, Character* player)
                 LeaveCriticalSection(&cs);
             }
         }
+
+        // moveDelay가 100ms 이하로 줄어들지 않도록 제한
+        if (moveDelay > 100) {
+            moveDelay -= 3;
+        }
+        else {
+            moveDelay = 100;
+        }
+
         Sleep(moveDelay);
-        moveDelay -= 3;
 
         // 충돌 체크 (매번 적 이동 후 체크)
         CheckCollisionWithEnemy(player);
@@ -253,6 +269,89 @@ void SpawnEnemy(int* spawnDelay)
         enemies[enemy_count].shape = "▽";
         enemies[enemy_count].active = 1;
         enemy_count++;
+    }
+}
+// 적 공격 이동 함수
+void EnemyAttackMove()
+{
+    while (!isGameOver)  // 게임 오버 상태가 아닐 때만 루프 실행
+    {
+        for (int i = 0; i < MAX_ENEMY_PROJECTILES; i++)
+        {
+            if (enemy_attacks[i].active)
+            {
+                EnterCriticalSection(&cs);
+                Attack_Position(enemy_attacks[i].x, enemy_attacks[i].y);
+                printf("  ");  // 이전 공격 위치 지우기
+
+                enemy_attacks[i].y += 1;  // 공격 아래로 이동
+
+                // 맵을 벗어나거나 맨 아래에서 공격 실행 방지
+                if (enemy_attacks[i].y >= 33 || enemy_attacks[i].y == 32)
+                {
+                    enemy_attacks[i].active = 0;
+                }
+                else
+                {
+                    // 공격 위치에 다른 오브젝트(적 또는 플레이어)가 있는지 확인
+                    int isOnEnemy = 0;
+                    for (int j = 0; j < enemy_count; j++)
+                    {
+                        if (enemies[j].active && enemies[j].x == enemy_attacks[i].x && enemies[j].y == enemy_attacks[i].y)
+                        {
+                            isOnEnemy = 1;  // 해당 위치에 적이 있음
+                            break;
+                        }
+                    }
+
+                    // 적이 없으면 공격을 표시
+                    if (!isOnEnemy)
+                    {
+                        Attack_Position(enemy_attacks[i].x, enemy_attacks[i].y);
+                        printf("|");
+                    }
+                    else
+                    {
+                        // 공격 위치에 적이 있을 경우, 적을 다시 출력
+                        Enemy_Position(enemy_attacks[i].x, enemy_attacks[i].y);
+                        printf("▽");
+                    }
+                }
+                LeaveCriticalSection(&cs);
+            }
+        }
+        Sleep(ENEMY_ATTACK_SPEED);  // 적 공격 이동 속도
+    }
+}
+// 적 공격 발사 함수
+void SpawnEnemyAttack()
+{
+    while (1)
+    {
+        int shotsFired = 0;  // 현재 발사한 적 공격 수
+
+        while (shotsFired < MAX_ENEMY_ATTACKS_PER_SHOT) // 한 번에 최대 10개 발사
+        {
+            int random_enemy_index = rand() % enemy_count; // 랜덤 적 선택
+
+            if (enemies[random_enemy_index].active)  // 활성화된 적만 발사
+            {
+                for (int j = 0; j < MAX_ENEMY_PROJECTILES; j++)
+                {
+                    if (!enemy_attacks[j].active)  // 비활성화된 공격 슬롯 찾기
+                    {
+                        enemy_attacks[j].x = enemies[random_enemy_index].x;    // 적의 위치에서 발사
+                        enemy_attacks[j].y = enemies[random_enemy_index].y + 1;  // 적의 바로 아래에서 시작
+                        enemy_attacks[j].active = 1;  // 공격 활성화
+
+                        shotsFired++;  // 발사한 공격 수 증가
+                        break;
+                    }
+                }
+            }
+        }
+
+        Sleep(ENEMY_ATTACK_INTERVAL);  // 적 공격 간격
     }
 }
 
@@ -291,24 +390,42 @@ DWORD WINAPI PlayerAttack(LPVOID lpParam)
     return 0;
 }
 // 적 소환 스레드 함수
-DWORD WINAPI EnemySpawn(LPVOID lpParam)
+WORD WINAPI EnemySpawn(LPVOID lpParam)
 {
     int spawnDelay = INITIAL_ENEMY_SPAWN_DELAY;
-    while (1)
+    while (!isGameOver) // 게임 오버 상태가 아닐 때만 적 소환
     {
         SpawnEnemy(&spawnDelay);
+
+        // spawnDelay가 200ms 이하로 줄어들지 않도록 제한
+        if (spawnDelay > 200) {
+            spawnDelay -= 3;
+        }
+        else {
+            spawnDelay = 200;
+        }
+
         Sleep(spawnDelay);
-        spawnDelay -= 3;
     }
+    return 0;
 }
+
 // 적 이동 스레드 함수
 DWORD WINAPI EnemyMove(LPVOID lpParam)
 {
     Character* player = (Character*)lpParam;
-    MoveEnemies(INITIAL_ENEMY_MOVE_DELAY, player);
+    while (!isGameOver)  // 게임 오버 상태가 아닐 때만 적 이동
+    {
+        MoveEnemies(INITIAL_ENEMY_MOVE_DELAY, player);
+    }
     return 0;
 }
-
+DWORD WINAPI ResetAttack(LPVOID lpParam)
+{
+    Sleep(ATTACK_COOLDOWN); // 공격 후 대기 시간
+    canAttack = 1; // 다시 공격 가능
+    return 0;
+}
 #pragma endregion
 
 // 플레이어
@@ -348,10 +465,17 @@ void Player()
                 }
                 break;
             case SPACE:
-                AttackParams* params = (AttackParams*)malloc(sizeof(AttackParams));
-                params->x = character.x;
-                params->y = character.y;
-                CreateThread(NULL, 0, PlayerAttack, (LPVOID)params, 0, NULL);
+                if (canAttack) // 공격 가능할 때만 공격 수행
+                {
+                    canAttack = 0; // 공격 불가능 상태로 변경
+                    AttackParams* params = (AttackParams*)malloc(sizeof(AttackParams));
+                    params->x = character.x;
+                    params->y = character.y;
+                    CreateThread(NULL, 0, PlayerAttack, (LPVOID)params, 0, NULL);
+
+                    // 일정 시간이 지난 후 다시 공격 가능하도록 설정
+                    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)ResetAttack, NULL, 0, NULL);
+                }
                 break;
             }
 
@@ -371,7 +495,7 @@ void Player()
 
 int main()
 {
-    system("mode con:cols=50 lines=35");
+    system("mode con:cols=44 lines=35");
     InitializeCriticalSection(&cs); // 크리티컬 섹션 초기화
     CursorView(); // 커서 삭제
     Rendering_Map(); // 맵
@@ -380,7 +504,10 @@ int main()
     Character player = { 2, 32, "▲" }; // 플레이어 캐릭터 생성
     CreateThread(NULL, 0, EnemySpawn, NULL, 0, NULL); // 적 스폰 스레드 생성
     CreateThread(NULL, 0, EnemyMove, (LPVOID)&player, 0, NULL);  // 적 이동 스레드 생성
+    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)EnemyAttackMove, NULL, 0, NULL);  // 적 공격 이동
+    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)SpawnEnemyAttack, NULL, 0, NULL);  // 적 공격 발사
 
+ 
     Player(); // 플레이어 함수 실행
 
     DeleteCriticalSection(&cs); // 크리티컬 섹션 해제
